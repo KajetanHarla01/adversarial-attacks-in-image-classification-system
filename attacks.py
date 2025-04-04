@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
+from collections import defaultdict
 
 # Mapowanie nazw na modele timm
 timm_models = {
@@ -26,17 +27,17 @@ timm_models = {
     'vit': 'vit_small_patch16_384'
 }
 
-def get_attack(attack_name, classifier, eps=0.03, targeted=False):
+def get_attack(attack_name, classifier, eps=0.03, targeted=False, max_iter=10):
     if attack_name == 'FGSM':
         return FastGradientMethod(estimator=classifier, eps=eps, targeted=targeted)
     elif attack_name == 'PGD':
         return ProjectedGradientDescent(estimator=classifier, eps=eps, eps_step=eps/4, max_iter=40, targeted=targeted)
     elif attack_name == 'CW':
-        return CarliniL2Method(classifier=classifier, targeted=targeted, max_iter=10)
+        return CarliniL2Method(classifier=classifier, targeted=targeted, max_iter=max_iter)
     elif attack_name == 'DeepFool':
-        return DeepFool(classifier=classifier, max_iter=10)
+        return DeepFool(classifier=classifier, max_iter=max_iter)
     elif attack_name == 'ZOO':
-        return ZooAttack(classifier=classifier, max_iter=1, nb_parallel=2, verbose=True)
+        return ZooAttack(classifier=classifier, max_iter=max_iter, nb_parallel=2, verbose=True)
     else:
         raise ValueError(f"Unsupported attack: {attack_name}")
 
@@ -113,6 +114,14 @@ def load_image(image_tensor):
     )
     return inv_normalize(image_tensor).permute(1, 2, 0).clamp(0, 1)
 
+def create_subset_per_class(dataset, samples_per_class=10):
+    class_indices = defaultdict(list)
+    for idx, (_, label) in enumerate(dataset):
+        if len(class_indices[label]) < samples_per_class:
+            class_indices[label].append(idx)
+    selected_indices = [idx for indices in class_indices.values() for idx in indices]
+    return torch.utils.data.Subset(dataset, selected_indices)
+
 def run_attack_on_dataset(model, data_loader, attack_type='FGSM', targeted=False):
     device = torch.device("cuda" if torch.cuda.is_available() and attack_type != 'ZOO' else "cpu")
     model.to(device)
@@ -127,53 +136,52 @@ def run_attack_on_dataset(model, data_loader, attack_type='FGSM', targeted=False
         device_type="cpu" if attack_type == 'ZOO' else "gpu"
     )
 
-    epsilons = [0.03] if attack_type == 'ZOO' else [0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
-    accs, f1s, precisions, recalls = [], [], [], []
-    psnrs, ssims = [], []
+    if attack_type in ['CW', 'DeepFool', 'ZOO']:
+        iterations = [10, 50, 100] if attack_type != 'ZOO' else [1, 10, 100]
+        for max_iter in iterations:
+            print(f"\nTesting max_iter: {max_iter}")
+            attack = get_attack(attack_type, classifier, max_iter=max_iter)
 
-    for eps in epsilons:
-        print(f"\nTesting epsilon: {eps}")
-        attack = get_attack(attack_type, classifier, eps=eps, targeted=targeted)
+            run_single_attack(classifier, data_loader, attack, attack_type)
+    else:
+        epsilons = [0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+        for eps in epsilons:
+            print(f"\nTesting epsilon: {eps}")
+            attack = get_attack(attack_type, classifier, eps=eps, targeted=targeted)
+            run_single_attack(classifier, data_loader, attack, attack_type)
 
-        all_preds_clean = []
-        all_preds_adv = []
-        all_labels = []
+def run_single_attack(classifier, data_loader, attack, attack_type):
+    all_preds_clean = []
+    all_preds_adv = []
+    all_labels = []
+    all_ssim = []
+    all_psnr = []
 
-        all_ssim = []
-        all_psnr = []
+    for i, (images, labels) in enumerate(data_loader):
+        x_numpy = images.numpy()
+        y_numpy = labels.numpy()
+        x_adv = attack.generate(x=x_numpy)
 
-        for i, (images, labels) in enumerate(data_loader):
-            x_numpy = images.numpy()
-            y_numpy = labels.numpy()
-            x_adv = attack.generate(x=x_numpy)
+        preds_clean = np.argmax(classifier.predict(x_numpy), axis=1)
+        preds_adv = np.argmax(classifier.predict(x_adv), axis=1)
 
-            preds_clean = np.argmax(classifier.predict(x_numpy), axis=1)
-            preds_adv = np.argmax(classifier.predict(x_adv), axis=1)
+        all_preds_clean.extend(preds_clean)
+        all_preds_adv.extend(preds_adv)
+        all_labels.extend(y_numpy)
 
-            all_preds_clean.extend(preds_clean)
-            all_preds_adv.extend(preds_adv)
-            all_labels.extend(y_numpy)
+        for j in range(images.shape[0]):
+            original = load_image(torch.tensor(x_numpy[j]))
+            adversarial = load_image(torch.tensor(x_adv[j]))
+            all_ssim.append(compute_ssim(original, adversarial))
+            all_psnr.append(compute_psnr(original, adversarial))
 
-            for j in range(images.shape[0]):
-                original = load_image(torch.tensor(x_numpy[j]))
-                adversarial = load_image(torch.tensor(x_adv[j]))
-                all_ssim.append(compute_ssim(original, adversarial))
-                all_psnr.append(compute_psnr(original, adversarial))
+    acc_adv = accuracy_score(all_labels, all_preds_adv)
+    f1_adv = f1_score(all_labels, all_preds_adv, average='weighted')
+    precision_adv = precision_score(all_labels, all_preds_adv, average='weighted', zero_division=1)
+    recall_adv = recall_score(all_labels, all_preds_adv, average='weighted', zero_division=1)
 
-        acc_adv = accuracy_score(all_labels, all_preds_adv)
-        f1_adv = f1_score(all_labels, all_preds_adv, average='weighted')
-        precision_adv = precision_score(all_labels, all_preds_adv, average='weighted', zero_division=1)
-        recall_adv = recall_score(all_labels, all_preds_adv, average='weighted', zero_division=1)
-
-        accs.append(acc_adv * 100)
-        f1s.append(f1_adv * 100)
-        precisions.append(precision_adv * 100)
-        recalls.append(recall_adv * 100)
-        ssims.append(np.mean(all_ssim))
-        psnrs.append(np.mean(all_psnr))
-
-        print(f"Adversarial Accuracy: {acc_adv * 100:.2f}%, F1: {f1_adv * 100:.2f}%, Precision: {precision_adv * 100:.2f}%, Recall: {recall_adv * 100:.2f}%")
-        print(f"Mean SSIM: {np.mean(all_ssim):.4f}, Mean PSNR: {np.mean(all_psnr):.2f} dB")
+    print(f"Adversarial Accuracy: {acc_adv * 100:.2f}%, F1: {f1_adv * 100:.2f}%, Precision: {precision_adv * 100:.2f}%, Recall: {recall_adv * 100:.2f}%")
+    print(f"Mean SSIM: {np.mean(all_ssim):.4f}, Mean PSNR: {np.mean(all_psnr):.2f} dB")
 
 if __name__ == '__main__':
     print("Choose a model:")
@@ -194,7 +202,10 @@ if __name__ == '__main__':
     attack_choice = int(input("Your choice (1-5): ")) - 1
     attack_name = attack_options[attack_choice]
 
-    dataset = datasets.ImageFolder(root='test', transform=get_transform(model))
+    samples_per_class = int(input("\nHow many samples per class? (e.g., 10): "))
+
+    dataset_full = datasets.ImageFolder(root='test', transform=get_transform(model))
+    dataset = create_subset_per_class(dataset_full, samples_per_class=samples_per_class)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False)
 
     run_attack_on_dataset(model, dataloader, attack_type=attack_name, targeted=False)

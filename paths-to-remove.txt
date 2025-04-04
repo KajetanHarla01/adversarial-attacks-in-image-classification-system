@@ -1,0 +1,3 @@
+final-models/convnext_timm-epoches-9.pth
+final-models/resnet_timm-epoches-3.pth
+final-models/visiontransformer_timm-epoches-6.pth
